@@ -1,0 +1,21 @@
+{
+  "SIGINT_ESP32_Link.bin": {
+    "title": "SIGINT ESP32 Link",
+    "list_title": "SIGINT LINK",
+    "target": "CLASSIC ESP32",
+    "description": "ESP32 companion link: Wi-Fi scan, BLE advertisements and requested GATT reads."
+  },
+  "WLED_16.0.1_ESP32.bin": {
+    "title": "WLED 16.0.1",
+    "list_title": "WLED 16.0.1",
+    "target": "CLASSIC ESP32",
+    "description": "Addressable LED controller for classic ESP32 boards."
+  },
+  "MicroPython_FullErase_v1.29.0.bin": {
+    "title": "MICROPYTHON FULL ERASE",
+    "list_title": "MICROPYTHON",
+    "target": "CLASSIC ESP32",
+    "mode": "full",
+    "description": "Python for classic ESP32. Full install erases existing firmware and flash data."
+  }
+}
