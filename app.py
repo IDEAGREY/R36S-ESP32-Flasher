@@ -582,6 +582,7 @@ class App:
         with self.flash_lock:
             self.flash_logs = []
         self.message('FLASH STARTED  |  KEEP USB CONNECTED', 'blue')
+        self.add_serial_log('FLASH STARTED: ' + self.flash_target)
         self.add_flash_log('TARGET: ' + self.flash_target)
         self.add_flash_log('PORT: ' + port_name(port))
         self.add_flash_log('BAUD: 115200')
@@ -692,6 +693,7 @@ class App:
             else:
                 self.flash_result_color = 'red'
             self.add_flash_log(self.notice)
+            self.add_serial_log('FLASH RESULT: ' + self.notice)
             self.busy = False
 
     def draw(self):
