@@ -16,8 +16,50 @@ import threading
 import time
 from pathlib import Path
 
+__version__ = '0.2.0'
 W, H = 640, 480
 ROOT = Path(__file__).resolve().parent
+
+
+def detect_screen_size(default=(640, 480)):
+    env_size = os.environ.get('R36S_SCREEN_SIZE', '')
+    if 'x' in env_size.lower():
+        try:
+            parts = env_size.lower().split('x', 1)
+            w, h = int(parts[0]), int(parts[1])
+            if w >= 320 and h >= 240:
+                return w, h
+        except ValueError:
+            pass
+    for sys_path in ('/sys/class/drm/card0-DSI-1/modes', '/sys/class/graphics/fb0/modes',
+                     '/sys/class/graphics/fb0/virtual_size'):
+        try:
+            raw = Path(sys_path).read_text().strip().splitlines()[0]
+            cleaned = raw.lstrip('U:').split('-', 1)[0].replace(',', 'x')
+            if 'x' in cleaned:
+                w, h = (int(x) for x in cleaned.split('x', 1)[:2])
+                if w == 720 and h in (720, 1440):
+                    return 720, 720
+                if w >= 640 and h >= 480:
+                    return (720, 720) if w == h else (640, 480)
+        except (OSError, ValueError, IndexError):
+            pass
+    return default
+
+
+def detect_device_title(w=640, h=480):
+    override = os.environ.get('R36S_DEVICE_MODEL', '').strip()
+    if override:
+        return override.upper()
+    try:
+        model = Path('/proc/device-tree/model').read_bytes().replace(b'\x00', b'').decode('ascii', 'replace').upper()
+        if 'R36MAX' in model or 'R36 MAX' in model:
+            return 'R36MAX'
+        if 'R36S' in model:
+            return 'R36S'
+    except OSError:
+        pass
+    return 'R36MAX' if (w == 720 and h == 720) else 'R36S'
 COLORS = {
     'bg': (231, 235, 242), 'panel': (250, 251, 253), 'white': (255, 255, 255),
     'line': (136, 151, 171), 'ink': (18, 29, 45), 'muted': (55, 70, 91),
@@ -43,8 +85,27 @@ def serial_ports():
 
 
 def esptool_path():
+    vendor_pkg = ROOT / 'engine' / 'vendor' / 'esptool'
+    if vendor_pkg.is_dir():
+        return sys.executable
     bundled = ROOT / 'engine' / 'bin' / 'esptool'
     return str(bundled) if bundled.is_file() else (shutil.which('esptool') or shutil.which('esptool.py'))
+
+
+def esptool_cmd(tool, *args):
+    vendor_dir = ROOT / 'engine' / 'vendor'
+    if tool == sys.executable and (vendor_dir / 'esptool').is_dir():
+        return [tool, '-m', 'esptool', *args]
+    return [tool, *args]
+
+
+def esptool_env():
+    env = os.environ.copy()
+    vendor_dir = ROOT / 'engine' / 'vendor'
+    if vendor_dir.is_dir():
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f"{vendor_dir}{os.pathsep}{existing}" if existing else str(vendor_dir)
+    return env
 
 
 def read_partitions(tool, port):
@@ -53,9 +114,9 @@ def read_partitions(tool, port):
     with tempfile.TemporaryDirectory(prefix='r36s-esp32-') as temp:
         table = Path(temp) / 'partitions.bin'
         try:
-            result = subprocess.run([tool, '--chip', 'esp32', '--port', port, '--baud', '115200',
-                                     'read_flash', '0x8000', '0x1000', str(table)],
-                                    capture_output=True, text=True, timeout=35)
+            result = subprocess.run(esptool_cmd(tool, '--chip', 'esp32', '--port', port, '--baud', '115200',
+                                                 'read_flash', '0x8000', '0x1000', str(table)),
+                                    capture_output=True, text=True, timeout=35, env=esptool_env())
         except subprocess.TimeoutExpired:
             NOTICE = 'NO BOOTLOADER REPLY  |  HOLD BOOT AND RETRY'
             return None
@@ -95,8 +156,8 @@ def connected_flash_bytes(tool, port):
     """Read the flash chip's reported capacity before any full-device write."""
     global NOTICE
     try:
-        result = subprocess.run([tool, '--chip', 'esp32', '--port', port, '--baud', '115200',
-                                 'flash_id'], capture_output=True, text=True, timeout=35)
+        result = subprocess.run(esptool_cmd(tool, '--chip', 'esp32', '--port', port, '--baud', '115200',
+                                             'flash_id'), capture_output=True, text=True, timeout=35, env=esptool_env())
     except (OSError, subprocess.TimeoutExpired):
         NOTICE = 'CANNOT IDENTIFY ESP32 FLASH CHIP'
         return None
@@ -130,7 +191,10 @@ def catalog():
 
 def firmware_dirs():
     dirs = [ROOT / 'firmware' / 'official', ROOT / 'firmware' / 'user', Path('/boot/ESP32-Firmware'),
-            Path('/boot/ESP32-Flasher'), Path('/roms/ports/R36S-ESP32-Flasher/firmware/user'),
+            Path('/boot/ESP32-Flasher'), Path('/roms/ESP32-Firmware'), Path('/roms2/ESP32-Firmware'),
+            Path.home() / 'ESP32-Firmware',
+            Path('/roms/ports/R36S-ESP32-Flasher/firmware/user'),
+            Path('/roms2/ports/R36S-ESP32-Flasher/firmware/user'),
             Path('/storage/roms/ports/R36S-ESP32-Flasher/firmware/user')]
     found = []
     for folder in dirs:
@@ -233,19 +297,31 @@ class Canvas:
         self.joystick_event_state = proc('SDL_JoystickEventState', integer, [integer])
         self.controller_joystick = proc('SDL_GameControllerGetJoystick', ptr, [ptr])
         self.joystick_id = proc('SDL_JoystickInstanceID', integer, [ptr])
+        self.output_size = proc('SDL_GetRendererOutputSize', integer, [ptr, C.POINTER(integer), C.POINTER(integer)])
+        self.set_hint = proc('SDL_SetHint', integer, [C.c_char_p, C.c_char_p])
         self.geterr = proc('SDL_GetError', C.c_char_p, [])
+        for db in ('/opt/inttools/gamecontrollerdb.txt', '/usr/share/gamecontrollerdb.txt'):
+            if Path(db).is_file() and 'SDL_GAMECONTROLLERCONFIG_FILE' not in os.environ:
+                os.environ['SDL_GAMECONTROLLERCONFIG_FILE'] = db
+                break
         if self.init(0x20 | 0x200 | 0x2000) != 0:
             raise RuntimeError(self.geterr().decode())
+        self.set_hint(b'SDL_RENDER_SCALE_QUALITY', b'0')
+        self.w, self.h = detect_screen_size((W, H))
         self.controllers, self.joysticks, self.controller_ids, self.input_indices = [], [], set(), set()
         self.controller_event_state(1); self.joystick_event_state(1); self.open_inputs()
         flags = 0x00000004 if os.environ.get('R36S_WINDOWED') else 0x00001001
-        self.win = self.createwin(b'R36S ESP-32 Flasher', 0x2FFF0000, 0x2FFF0000, W, H, flags)
+        self.win = self.createwin(b'R36S / R36MAX ESP-32 Flasher', 0x2FFF0000, 0x2FFF0000, self.w, self.h, flags)
         if not self.win:
             raise RuntimeError(self.geterr().decode())
         self.r = self.renderer(self.win, -1, 0x02 | 0x04) or self.renderer(self.win, -1, 0)
         if not self.r:
             raise RuntimeError(self.geterr().decode())
-        self.logical(self.r, W, H)
+        if not os.environ.get('R36S_SCREEN_SIZE') and not os.environ.get('R36S_WINDOWED'):
+            ow, oh = C.c_int(0), C.c_int(0)
+            if self.output_size(self.r, C.byref(ow), C.byref(oh)) == 0 and ow.value >= 720 and ow.value == oh.value:
+                self.w, self.h = 720, 720
+        self.logical(self.r, self.w, self.h)
         pixels = bytearray((ROOT / 'assets' / 'font.rgba').read_bytes())
         for gy in range(6):
             for gx in range(16):
@@ -317,6 +393,10 @@ class Canvas:
 class App:
     def __init__(self, canvas):
         self.g = canvas
+        self.w = getattr(canvas, 'w', W)
+        self.h = getattr(canvas, 'h', H)
+        self.device_title = detect_device_title(self.w, self.h)
+        self.select_held = False
         self.items = list_firmware()
         self.index = 0
         self.scroll = 0
@@ -370,7 +450,7 @@ class App:
             return
         with self.flash_lock:
             self.flash_logs.append(shorten(line, 72))
-            self.flash_logs = self.flash_logs[-10:]
+            self.flash_logs = self.flash_logs[-18:]
 
     def add_serial_log(self, line):
         line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', str(line))
@@ -458,8 +538,9 @@ class App:
         self.add_flash_log(phase)
         output = []
         try:
-            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    bufsize=0)
+            cmd = esptool_cmd(args[0], *args[1:]) if args else args
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    bufsize=0, env=esptool_env())
         except OSError as error:
             self.add_flash_log('ERROR: ' + str(error))
             return 127, str(error)
@@ -510,21 +591,26 @@ class App:
             self.add_flash_log(phase + ' FAILED')
         return code, '\n'.join(output)
 
+    def visible_rows(self):
+        return 9 if self.h >= 720 else 5
+
     def refresh(self):
         current = str(self.selected()) if self.selected() else ''
         self.items = list_firmware()
         self.index = next((i for i, item in enumerate(self.items) if str(item) == current), 0)
-        self.scroll = min(self.scroll, max(0, len(self.items) - 5))
+        rows = self.visible_rows()
+        self.scroll = min(self.scroll, max(0, len(self.items) - rows))
         self.message(f'{len(self.items)} FILES READY  |  FIRMWARE LIST UPDATED', 'green')
 
     def move(self, step):
         if not self.items:
             return
+        rows = self.visible_rows()
         self.index = max(0, min(len(self.items) - 1, self.index + step))
         if self.index < self.scroll:
             self.scroll = self.index
-        if self.index >= self.scroll + 5:
-            self.scroll = self.index - 4
+        if self.index >= self.scroll + rows:
+            self.scroll = self.index - (rows - 1)
 
     def activate(self):
         if self.busy:
@@ -698,6 +784,18 @@ class App:
 
     def draw(self):
         g = self.g
+        w, h = self.w, self.h
+        square = h >= 720
+        side_w = 216 if square else 193
+        rx = side_w + 8
+        rw = w - rx - 8
+        footer_y = h - 44
+        panel_h = footer_y - 13
+        count_y = footer_y - 16
+        rows = self.visible_rows()
+        title_limit = 17 if square else 15
+        detail_chars = 47 if square else 41
+
         g.set_color('bg'); g.clear(g.r)
         if self.section == 'LOGS':
             self.draw_logs()
@@ -705,28 +803,28 @@ class App:
             return
         port = self.selected_port()
         status = 'USB READY' if port and os.access(port, os.R_OK | os.W_OK) else ('USB ACCESS' if port else 'USB EMPTY')
-        g.rect(0, 0, 193, H, 'panel', 'line')
-        g.rect(8, 8, 177, 59, 'blue')
-        g.text(18, 21, 'R36S', 'white', 1.55)
+        g.rect(0, 0, side_w, h, 'panel', 'line')
+        g.rect(8, 8, side_w - 16, 59, 'blue')
+        g.text(18, 21, self.device_title, 'white', 1.55)
         g.text(18, 44, 'ESP-32 FLASHER', 'white', 1.25)
-        g.rect(8, 76, 177, 42, 'white', 'line')
+        g.rect(8, 76, side_w - 16, 42, 'white', 'line')
         g.rect(15, 92, 10, 10, 'green' if status == 'USB READY' else 'amber' if port else 'red')
         g.text(34, 88, status, 'green' if status == 'USB READY' else 'amber' if port else 'red', 1.2, 17)
-        g.rect(8, 126, 177, 31, 'blue2')
+        g.rect(8, 126, side_w - 16, 31, 'blue2')
         g.text(18, 132, 'FIRMWARE', 'white', 1.25)
-        for row in range(5):
+        for row in range(rows):
             i = self.scroll + row
             y = 163 + row * 50
             if i >= len(self.items):
                 break
             path = self.items[i]
             active = i == self.index
-            g.rect(12, y, 169, 46, 'select' if active else ('white' if row % 2 == 0 else 'panel'),
+            g.rect(12, y, side_w - 24, 46, 'select' if active else ('white' if row % 2 == 0 else 'panel'),
                    'blue2' if active else 'grid')
             g.rect(12, y + 1, 6, 44, 'green')
             meta = self.load_catalog.get(path.name, {})
             title = meta.get('list_title', meta.get('title', path.stem.replace('_', ' ')))
-            g.text(24, y + 2, shorten(title.upper(), 15), 'blue' if active else 'ink', 1.18)
+            g.text(24, y + 2, shorten(title.upper(), title_limit), 'blue' if active else 'ink', 1.18)
             try:
                 size = path.stat().st_size
                 detail = 'FULL ERASE' if meta.get('mode') == 'full' else f'{size / 1048576:.2f} MB'
@@ -737,53 +835,64 @@ class App:
             g.text(19, 170, 'NO FIRMWARE', 'red', 1.2)
             g.text(19, 199, 'COPY BIN TO', 'muted', 1.1)
             g.text(19, 222, '/BOOT/ESP32-FIRMWARE', 'blue', 0.95)
-        g.rect(12, 420, 169, 43, 'white', 'line')
-        g.text(20, 424, f'{len(self.items)} FILES', 'green', 1.15)
-        g.text(20, 445, 'X  RESCAN', 'blue', 1.1)
+        g.rect(12, count_y, side_w - 24, 43, 'white', 'line')
+        g.text(20, count_y + 4, f'{len(self.items)} FILES', 'green', 1.15)
+        g.text(20, count_y + 25, 'X  RESCAN', 'blue', 1.1)
 
-        g.rect(201, 8, 431, 423, 'panel', 'line')
-        g.rect(201, 8, 431, 38, 'blue2')
+        g.rect(rx, 8, rw, panel_h, 'panel', 'line')
+        g.rect(rx, 8, rw, 38, 'blue2')
         path = self.selected()
-        g.text(216, 22, 'FIRMWARE DETAILS', 'white', 1.25)
+        g.text(rx + 15, 22, 'FIRMWARE DETAILS', 'white', 1.25)
         if path:
             meta = self.load_catalog.get(path.name, {})
             is_full = meta.get('mode') == 'full'
-            g.text(218, 58, shorten(meta.get('title', path.stem.replace('_', ' ')).upper(), 29), 'blue', 1.55)
-            g.rect(218, 86, 396, 2, 'blue2')
-            g.text(218, 103, 'BOARD', 'muted', 1.15); g.text(303, 101, 'CLASSIC ESP32', 'ink', 1.2)
-            g.text(218, 135, 'IMAGE', 'muted', 1.15)
+            g.text(rx + 17, 58, shorten(meta.get('title', path.stem.replace('_', ' ')).upper(), 33 if square else 29), 'blue', 1.55)
+            g.rect(rx + 17, 86, rw - 35, 2, 'blue2')
+            g.text(rx + 17, 103, 'BOARD', 'muted', 1.15); g.text(rx + 102, 101, 'CLASSIC ESP32', 'ink', 1.2)
+            g.text(rx + 17, 135, 'IMAGE', 'muted', 1.15)
             try:
                 size = path.stat().st_size
-                g.text(303, 133, f'{size / 1048576:.2f} MB', 'ink', 1.2)
+                g.text(rx + 102, 133, f'{size / 1048576:.2f} MB', 'ink', 1.2)
             except OSError:
-                g.text(303, 133, 'FILE MISSING', 'red', 1.15)
-            g.text(218, 170, 'ABOUT', 'muted', 1.15)
+                g.text(rx + 102, 133, 'FILE MISSING', 'red', 1.15)
+            g.text(rx + 17, 170, 'ABOUT', 'muted', 1.15)
             desc = meta.get('description', 'ESP32 firmware image.')
-            for i, line in enumerate([shorten(desc[j:j + 41], 41) for j in range(0, min(len(desc), 82), 41)]):
-                g.text(218, 195 + i * 23, line.upper(), 'ink', 1.12, 41)
+            max_desc = detail_chars * (3 if square else 2)
+            for i, line in enumerate([shorten(desc[j:j + detail_chars], detail_chars) for j in range(0, min(len(desc), max_desc), detail_chars)]):
+                g.text(rx + 17, 195 + i * 23, line.upper(), 'ink', 1.12, detail_chars)
+            cta_y = 294 if square else 274
             if is_full:
-                g.rect(218, 274, 396, 94, 'red', 'line')
-                g.text(230, 282, 'A  ERASE + INSTALL', 'white', 1.45)
-                g.text(230, 313, 'PRESS A AGAIN TO CONFIRM', 'white', 1.15)
-                g.text(230, 340, 'REPLACES CURRENT ESP32 DATA', 'white', 1.1)
-                g.text(218, 380, 'CLASSIC ESP32  |  MINIMUM 4 MB', 'red', 1.12)
+                g.rect(rx + 17, cta_y, rw - 35, 94, 'red', 'line')
+                g.text(rx + 29, cta_y + 8, 'A  ERASE + INSTALL', 'white', 1.45)
+                g.text(rx + 29, cta_y + 39, 'PRESS A AGAIN TO CONFIRM', 'white', 1.15)
+                g.text(rx + 29, cta_y + 66, 'REPLACES CURRENT ESP32 DATA', 'white', 1.1)
+                g.text(rx + 17, cta_y + 106, 'CLASSIC ESP32  |  MINIMUM 4 MB', 'red', 1.12)
             else:
-                g.rect(218, 274, 396, 82, 'greenbg', 'line')
-                g.text(230, 283, 'A  FLASH + VERIFY', 'green', 1.45)
-                g.text(230, 315, 'APP ONLY  |  115200 BAUD', 'ink', 1.18)
-                g.text(218, 370, 'BOOTLOADER AND SETTINGS STAY', 'muted', 1.08)
+                g.rect(rx + 17, cta_y, rw - 35, 82, 'greenbg', 'line')
+                g.text(rx + 29, cta_y + 9, 'A  FLASH + VERIFY', 'green', 1.45)
+                g.text(rx + 29, cta_y + 41, 'APP ONLY  |  115200 BAUD', 'ink', 1.18)
+                g.text(rx + 17, cta_y + 96, 'BOOTLOADER AND SETTINGS STAY', 'muted', 1.08)
+            if square:
+                g.rect(rx + 17, 430, rw - 35, 196, 'white', 'grid')
+                g.text(rx + 29, 444, 'CONNECTION & SAFETY CHECKS', 'blue', 1.18)
+                g.text(rx + 29, 474, 'PORT: ' + shorten(port_name(port), 36), 'ink', 1.08, 44)
+                g.text(rx + 29, 500, 'DISPLAY: 720X720 1:1 IPS (R36MAX)', 'muted', 1.05, 44)
+                g.text(rx + 29, 526, 'CUSTOM BIN: /BOOT/ESP32-FIRMWARE/', 'muted', 1.05, 44)
+                g.text(rx + 29, 552, 'OR /ROMS/ESP32-FIRMWARE/', 'muted', 1.05, 44)
+                g.text(rx + 29, 584, 'SELECT+START OR START -> EXIT', 'blue', 1.05, 44)
         else:
-            g.text(226, 110, 'NO FIRMWARE SELECTED', 'blue', 1.45)
-            g.text(226, 158, 'COPY BIN FILES TO:', 'ink', 1.25)
-            g.rect(218, 195, 396, 49, 'select', 'line')
-            g.text(230, 210, '/BOOT/ESP32-FIRMWARE/', 'blue', 1.2)
-            g.text(226, 278, 'A  FLASHES AND VERIFIES', 'green', 1.2)
-            g.text(226, 319, 'X  RESCANS THE CARD', 'muted', 1.2)
+            g.text(rx + 25, 110, 'NO FIRMWARE SELECTED', 'blue', 1.45)
+            g.text(rx + 25, 158, 'COPY BIN FILES TO:', 'ink', 1.25)
+            g.rect(rx + 17, 195, rw - 35, 49, 'select', 'line')
+            g.text(rx + 29, 210, '/BOOT/ESP32-FIRMWARE/', 'blue', 1.2)
+            g.text(rx + 25, 278, 'A  FLASHES AND VERIFIES', 'green', 1.2)
+            g.text(rx + 25, 319, 'X  RESCANS THE CARD', 'muted', 1.2)
 
-        g.rect(8, 436, 624, 43, 'white', 'line')
+        g.rect(8, footer_y, w - 16, 43, 'white', 'line')
         color = COLORS.get(self.notice_color, COLORS['blue'])
-        g.text(16, 439, self.notice, color, 1.0, 68)
-        g.text(16, 462, 'UP/DOWN FILES   A FLASH   Y LOGS   START MENU', 'blue', 1.0, 74)
+        max_notice = 78 if square else 68
+        g.text(16, footer_y + 3, self.notice, color, 1.0, max_notice)
+        g.text(16, footer_y + 26, 'UP/DOWN FILES   A FLASH   Y LOGS   START MENU', 'blue', 1.0, 74)
         if self.flash_dialog:
             self.draw_flash_dialog()
         elif self.menu_open:
@@ -792,19 +901,26 @@ class App:
 
     def draw_logs(self):
         g = self.g
+        w, h = self.w, self.h
+        square = h >= 720
         port = self.selected_port()
         listening = bool(self.serial_thread and self.serial_thread.is_alive() and not self.serial_stop.is_set())
         status = self.serial_status
-        g.rect(10, 8, 620, 39, 'blue')
+        box_w = w - 20
+        footer_y = h - 42
+        log_h = footer_y - 112
+        rows = 23 if square else 13
+        line_chars = 82 if square else 72
+
+        g.rect(10, 8, box_w, 39, 'blue')
         g.text(24, 20, 'ESP32 SERIAL LOGS', 'white', 1.5)
-        g.rect(10, 55, 620, 42, 'white', 'line')
+        g.rect(10, 55, box_w, 42, 'white', 'line')
         g.rect(18, 70, 10, 10, 'green' if listening else 'amber' if port else 'red')
         g.text(38, 66, status, 'green' if listening else 'amber' if port else 'red', 1.15, 35)
-        g.text(362, 66, shorten(port_name(port) if port else 'NO USB DEVICE', 31), 'blue', 1.05, 31)
-        g.rect(10, 104, 620, 326, 'black', 'line')
+        g.text(w - 278, 66, shorten(port_name(port) if port else 'NO USB DEVICE', 31), 'blue', 1.05, 31)
+        g.rect(10, 104, box_w, log_h, 'black', 'line')
         with self.serial_lock:
             logs = list(self.serial_logs)
-        rows = 13
         end = max(0, len(logs) - self.serial_log_scroll)
         start = max(0, end - rows)
         visible = logs[start:end]
@@ -813,50 +929,65 @@ class App:
                        'After connecting, reset the ESP32 to capture its boot output.',
                        'Some firmware sends no readable serial text.']
         for index, line in enumerate(visible[-rows:]):
-            g.text(20, 115 + index * 23, shorten(line, 72), 'green', 1.05, 72)
-        g.rect(10, 438, 620, 41, 'white', 'line')
+            g.text(20, 115 + index * 23, shorten(line, line_chars), 'green', 1.05, line_chars)
+        g.rect(10, footer_y, box_w, 41, 'white', 'line')
         listen_action = 'A STOP LOGS' if listening else 'A START LOGS'
-        g.text(18, 443, f'{listen_action}   X CLEAR   UP/DOWN SCROLL   B BACK', 'blue', 0.96, 75)
-        g.text(18, 462, 'L/R PORT   Y FIRMWARE   START MENU', 'blue', 0.98, 61)
+        g.text(18, footer_y + 5, f'{listen_action}   X CLEAR   UP/DOWN SCROLL   B BACK', 'blue', 0.96, 75)
+        g.text(18, footer_y + 24, 'L/R PORT   Y FIRMWARE   START MENU', 'blue', 0.98, 61)
 
     def draw_exit_menu(self):
         g = self.g
-        g.rect(0, 0, W, H, 'bg')
-        g.rect(30, 70, 580, 340, 'white', 'blue')
-        g.rect(38, 78, 564, 54, 'blue')
-        g.text(58, 95, 'OPTIONS', 'white', 1.65)
+        w, h = self.w, self.h
+        mw = min(580, w - 60)
+        mh = 340
+        mx = (w - mw) // 2
+        my = (h - mh) // 2
+        g.rect(0, 0, w, h, 'bg')
+        g.rect(mx, my, mw, mh, 'white', 'blue')
+        g.rect(mx + 8, my + 8, mw - 16, 54, 'blue')
+        g.text(mx + 28, my + 25, 'OPTIONS', 'white', 1.65)
         choices = ('EXIT TO EMULATIONSTATION', 'RETURN TO FLASHER')
         for index, label in enumerate(choices):
-            y = 160 + index * 72
+            y = my + 90 + index * 72
             active = index == self.menu_index
-            g.rect(58, y, 524, 58, 'select' if active else 'panel', 'blue2' if active else 'line')
-            g.text(76, y + 17, label, 'blue' if active else 'ink', 1.35)
-        g.text(58, 326, 'UP/DOWN CHOOSE   A SELECT   B BACK', 'blue', 1.12)
+            g.rect(mx + 28, y, mw - 56, 58, 'select' if active else 'panel', 'blue2' if active else 'line')
+            g.text(mx + 46, y + 17, label, 'blue' if active else 'ink', 1.35)
+        g.text(mx + 28, my + 256, 'UP/DOWN CHOOSE   A SELECT   B BACK', 'blue', 1.12)
 
     def draw_flash_dialog(self):
         g = self.g
-        g.rect(0, 0, W, H, 'bg')
-        g.rect(20, 18, 600, 444, 'white', 'blue')
-        g.rect(28, 26, 584, 47, 'blue')
+        w, h = self.w, self.h
+        square = h >= 720
+        dw = w - 40
+        dh = h - 36
+        bar_w = dw - 44
+        log_rows = 16 if square else 9
+        log_h = dh - 238
+        line_chars = 66 if square else 58
+
+        g.rect(0, 0, w, h, 'bg')
+        g.rect(20, 18, dw, dh, 'white', 'blue')
+        g.rect(28, 26, dw - 16, 47, 'blue')
         g.text(42, 39, 'FLASH: ' + shorten(self.flash_target, 48), 'white', 1.25, 52)
         g.text(42, 87, self.flash_phase, 'blue', 1.25, 55)
-        g.rect(42, 116, 556, 32, 'white', 'blue2')
+        g.rect(42, 116, bar_w, 32, 'white', 'blue2')
         percent = max(0, min(100, self.flash_percent))
-        fill = max(0, int(548 * percent / 100))
+        fill = max(0, int((bar_w - 8) * percent / 100))
         if fill:
             g.rect(46, 120, fill, 24, self.flash_result_color if self.flash_done else 'blue2')
-        g.text(548, 124, f'{percent:3d}%', 'ink' if percent < 17 else 'white', 1.12)
+        g.text(42 + bar_w - 50, 124, f'{percent:3d}%', 'ink' if percent < 17 else 'white', 1.12)
         g.text(42, 164, 'FLASH LOG', 'blue', 1.22)
-        g.rect(42, 188, 556, 206, 'black', 'line')
+        g.rect(42, 188, bar_w, log_h, 'black', 'line')
         with self.flash_lock:
-            logs = list(self.flash_logs[-9:])
+            logs = list(self.flash_logs[-log_rows:])
         for i, line in enumerate(logs):
-            g.text(52, 198 + i * 21, shorten(line, 58),
-                   'red' if self.flash_done and self.flash_result_color == 'red' else 'green', 1.08, 58)
-        g.rect(42, 407, 556, 39, 'greenbg' if self.flash_done and self.flash_result_color == 'green' else 'white', 'line')
+            g.text(52, 198 + i * 21, shorten(line, line_chars),
+                   'red' if self.flash_done and self.flash_result_color == 'red' else 'green', 1.08, line_chars)
+        footer_y = 18 + dh - 55
+        g.rect(42, footer_y, bar_w, 39, 'greenbg' if self.flash_done and self.flash_result_color == 'green' else 'white', 'line')
         footer = 'A / B CLOSE' if self.flash_done else 'KEEP ESP32 CONNECTED  |  DO NOT EXIT'
         footer_color = 'green' if self.flash_done and self.flash_result_color == 'green' else 'red' if self.flash_done else 'blue'
-        g.text(54, 418, footer, footer_color, 1.18, 52)
+        g.text(54, footer_y + 11, footer, footer_color, 1.18, 52)
 
     def key(self, key):
         if self.flash_dialog:
@@ -944,18 +1075,35 @@ class App:
                             4: 'a', 5: 'b', 27: 'x', 22: 's', 28: 'y'}
                     if code in keys and not event.raw[13]:
                         self.key(keys[code])
+                if typ == 0x652:
+                    if event.raw[12] == 4:
+                        self.select_held = False
                 if typ == 0x651:
                     button = event.raw[12]
+                    if button == 4:
+                        self.select_held = True
+                    if self.select_held and button == 6 and not self.busy:
+                        self.running = False
+                        break
                     key = {0: 'b', 1: 'a', 2: 'x', 3: 'y', 4: 'escape', 6: 'start',
                            9: 'l', 10: 'r', 11: 'up', 12: 'down', 13: 'left', 14: 'right'}.get(button)
                     if key:
                         self.key(key)
                 which = struct.unpack_from('i', event.raw, 8)[0]
                 raw_pad = which not in self.g.controller_ids
+                if typ == 0x604 and raw_pad:
+                    if event.raw[12] in (6, 8):
+                        self.select_held = False
                 if typ == 0x603 and raw_pad:
                     button = event.raw[12]
+                    if button in (6, 8):
+                        self.select_held = True
+                    if self.select_held and button in (7, 9) and not self.busy:
+                        self.running = False
+                        break
                     key = {0: 'b', 1: 'a', 2: 'x', 3: 'y', 4: 'l', 5: 'r', 6: 'start', 7: 'start',
-                           8: 'up', 9: 'down', 10: 'left', 11: 'right', 13: 'b'}.get(button)
+                           8: 'up', 9: 'down', 10: 'left', 11: 'right',
+                           12: 'up', 13: 'down', 14: 'left', 15: 'right'}.get(button)
                     if key:
                         self.key(key)
                 if typ == 0x602 and raw_pad:

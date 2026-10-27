@@ -24,7 +24,20 @@ runtime output only when the installed firmware emits readable serial text.
   touch, and pin layout. Merged images and multi-file board installers are not
   supported.
 
-## 1. Prepare an ArkOS microSD card
+## R36MAX & dArkOS (`arkos4clone`) compatibility
+
+This flasher runs natively on both the **R36MAX (720×720 1:1 IPS)** and the **R36S / R33S / R35S / R36H (640×480 4:3)**:
+
+- **Adaptive 720×720 & 640×480 layout:** Automatically detects the R36MAX's 720×720 square display via `SDL_GetRendererOutputSize` and `/sys/class/graphics/fb0/virtual_size`, expanding the UI to 9 visible firmware rows and 23 serial log lines while keeping nearest-neighbor crisp bitmap text (`SDL_RENDER_SCALE_QUALITY=0`).
+- **dArkOS (`arkos4clone`) & dual-SD (`TF2`) support:** `install.sh` automatically targets `/roms2/ports` when a second microSD card is active, or `/roms/ports` on single-card setups, and loads `/opt/inttools/gamecontrollerdb.txt` (or `/usr/share/gamecontrollerdb.txt`) so all R36MAX gamepad controls and `Select + Start` work out of the box.
+- **SSH quick install (R36MAX / dArkOS with Wi-Fi or USB Ethernet):**
+  ```bash
+  scp R36S-ESP32-Flasher-0.2.0.zip ark@<handheld-ip>:/home/ark/
+  ssh ark@<handheld-ip> "unzip -qo ~/R36S-ESP32-Flasher-0.2.0.zip -d ~ && bash ~/R36S-ESP32-Flasher/install.sh"
+  ```
+  Then restart EmulationStation (`sudo systemctl restart emulationstation` or reboot) and open **Ports → R36S ESP-32 Flasher**.
+
+## 1. Prepare an ArkOS / dArkOS microSD card
 
 The card must already have a working ArkOS installation before installing this
 Ports app. A blank card will not show Ports.
